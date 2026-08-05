@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -141,7 +142,7 @@ func main() {
 
 	pid = mpiProcess.Process.Pid
 
-	checkpointDir := checkpoint(c)
+	checkpointDir := checkpoint(c, "")
 	checkpoints = append(checkpoints, checkpointDir)
 	checkpointmanager.AddCheckpointLog()
 	websocket.HandleCriuCheckpoint()
@@ -173,7 +174,11 @@ func main() {
 		case command.GlobalRollback:
 			handleRollbackSubmission(cmd)
 		case command.Checkpoint:
-			checkpointDir = checkpoint(c)
+			prevDir := ""
+			if currentCheckpointTree != nil {
+				prevDir = currentCheckpointTree.GetCheckpointDir()
+			}
+			checkpointDir = checkpoint(c, prevDir)
 
 			checkpoints = append(checkpoints, checkpointDir)
 			//fmt.Println(checkpoints)
@@ -551,7 +556,7 @@ func copy(src string, dst string) {
 
 func restoreCriu(checkpointDir string, pid int, numProcesses int) *os.File {
 
-	cmd := exec.Command("criu", "restore", "-v4", "--unprivileged", "-o", "restore.log", "-j", "-D", checkpointDir) //"--tcp-established",
+	cmd := exec.Command("criu", "restore", "-v4", "--unprivileged", "--track-mem", "-o", "restore.log", "-j", "-D", checkpointDir) //"--tcp-established",
 
 	f, err := pty.Start(cmd)
 	if err != nil {
@@ -564,10 +569,10 @@ func restoreCriu(checkpointDir string, pid int, numProcesses int) *os.File {
 	return f
 }
 
-func checkpoint(c *criu.Criu) string{
-	if program=="criu"{
-		return checkpointCRIU(numProcesses, c, pid, true)
-	}else{ // if program=="dmtcp"
+func checkpoint(c *criu.Criu, prevImgDir string) string {
+	if program == "criu" {
+		return checkpointCRIU(numProcesses, c, pid, true, prevImgDir)
+	} else { // if program=="dmtcp"
 		return checkpointDmtcp()
 	}
 }
@@ -606,7 +611,7 @@ func checkpointDmtcp() string{
 	return imgDir.Name()
 }
 
-func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool) string {
+func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool, prevImgDir string) string {
 	nodeconnection.Stop()
 	nodeconnection.Detach()
 	nodeconnection.Reset()
@@ -622,7 +627,7 @@ func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool)
 	logger.Info(imgDir.Name())
 
 	// Calls CRIU, saves process data to checkpointDir
-	Dump(c, strconv.Itoa(pid), false, imgDir.Name(), "", leave_running)
+	Dump(c, strconv.Itoa(pid), false, imgDir.Name(), prevImgDir, leave_running)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -654,13 +659,18 @@ func Dump(c *criu.Criu, pidS string, pre bool, imgDir string, prevImg string, le
 		// TcpEstablished: proto.Bool(true),
 		Unprivileged: proto.Bool(true),
 		GhostLimit:   proto.Uint32(1048576 * 64),
+		TrackMem:     proto.Bool(true),
 	}
 
 	logger.Info(imgDir)
 
 	if prevImg != "" {
-		opts.ParentImg = proto.String(prevImg)
-		opts.TrackMem = proto.Bool(true)
+		relPath, err := filepath.Rel(imgDir, prevImg)
+		if err != nil {
+			logger.Error("Could not calculate relative path: %v", err)
+		} else {
+			opts.ParentImg = proto.String(relPath)
+		}
 	}
 
 	if pre {
