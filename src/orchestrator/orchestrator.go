@@ -276,8 +276,8 @@ func calculateReverseStepCommands(cmd *command.Command) {
 		bpmap[i] = nodeconnection.GetBreakpoints(i)
 	}
 
-	// tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
-	restore(rootCheckpointTree.GetCheckpointDir(), pid, numProcesses)
+	tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
+	restore(tree.GetCheckpointDir(), pid, numProcesses)
 	websocket.HandleCriuRestore(0)
 	checkpointmanager.SetCheckpointLog(0)
 
@@ -341,9 +341,9 @@ func calculateReverseContinueCommands(cmd *command.Command) {
 		bpmap[i] = nodeconnection.GetBreakpoints(i)
 	}
 
-	// tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
-	breakpointHitMap := reverseContLoop(cmd, rootCheckpointTree.GetCheckpointDir(), counters, bpmap, nil, false)
-	reverseContLoop(cmd, rootCheckpointTree.GetCheckpointDir(), counters, bpmap, breakpointHitMap, true)
+	tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
+	breakpointHitMap := reverseContLoop(cmd, tree.GetCheckpointDir(), counters, bpmap, nil, false)
+	reverseContLoop(cmd, tree.GetCheckpointDir(), counters, bpmap, breakpointHitMap, true)
 
 	// Remove the breakpoint that was hit
 	for i := 0; i < numProcesses; i++ {
