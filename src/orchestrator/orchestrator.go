@@ -224,18 +224,12 @@ func main() {
 		}
 	}
 }
-func createCpDir() *os.File {
-			//we create the checkpoint dir
-			imgDir, err := os.MkdirTemp(fmt.Sprintf("%v/temp", utils.GetExecutableDir()), "cp-*")
-		
-			if err != nil {
-				logger.Error("Error creating folder, %v", err)
-			}
-			img, err := os.Open(imgDir)//, os.O_RDWR|os.O_CREATE, 0644)
-			if err != nil {
-				logger.Error("Can't open image dir: %v", err)
-			}
-			return img	
+func createCpDir() string {
+	imgDir, err := os.MkdirTemp(fmt.Sprintf("%v/temp", utils.GetExecutableDir()), "cp-*")
+	if err != nil {
+		logger.Error("Error creating folder, %v", err)
+	}
+	return imgDir
 }
 func findTreeByDir(tree *checkpointmanager.CheckpointTree, dir string) *checkpointmanager.CheckpointTree {
 	if dir == tree.GetCheckpointDir() {
@@ -603,12 +597,12 @@ func checkpointDmtcp() string{
 		logger.Error("problem renameing",err)
 	}
 	for _, e := range entries {
-		err :=  os.Rename(dmtcpImgDir+"/"+e.Name(), imgDir.Name()+"/"+e.Name())
+		err := os.Rename(dmtcpImgDir+"/"+e.Name(), imgDir+"/"+e.Name())
 		if err != nil {
 			fmt.Println(err)
 		}
-    }
-	return imgDir.Name()
+	}
+	return imgDir
 }
 
 func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool, prevImgDir string) string {
@@ -624,17 +618,17 @@ func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool,
 	if err != nil {
 		logger.Error("Error creating folder, %v", err)
 	}*/
-	logger.Info(imgDir.Name())
+	logger.Info(imgDir)
 
 	// Calls CRIU, saves process data to checkpointDir
-	Dump(c, strconv.Itoa(pid), false, imgDir.Name(), prevImgDir, leave_running)
+	Dump(c, strconv.Itoa(pid), false, imgDir, prevImgDir, leave_running)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go connectBackToNodes(numProcesses, true, &wg)
 	wg.Wait()
 	// logger.Verbose("UPPER CP FINISH")
-	return imgDir.Name()
+	return imgDir
 }
 
 func Dump(c *criu.Criu, pidS string, pre bool, imgDir string, prevImg string, leave_running bool) {
