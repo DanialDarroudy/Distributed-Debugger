@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -141,7 +142,7 @@ func main() {
 
 	pid = mpiProcess.Process.Pid
 
-	checkpointDir := checkpoint(c)
+	checkpointDir := checkpoint(c, "")
 	checkpoints = append(checkpoints, checkpointDir)
 	checkpointmanager.AddCheckpointLog()
 	websocket.HandleCriuCheckpoint()
@@ -173,7 +174,11 @@ func main() {
 		case command.GlobalRollback:
 			handleRollbackSubmission(cmd)
 		case command.Checkpoint:
-			checkpointDir = checkpoint(c)
+			prevDir := ""
+			if currentCheckpointTree != nil {
+				prevDir = currentCheckpointTree.GetCheckpointDir()
+			}
+			checkpointDir = checkpoint(c, prevDir)
 
 			checkpoints = append(checkpoints, checkpointDir)
 			//fmt.Println(checkpoints)
@@ -219,18 +224,12 @@ func main() {
 		}
 	}
 }
-func createCpDir() *os.File {
-			//we create the checkpoint dir
-			imgDir, err := os.MkdirTemp(fmt.Sprintf("%v/temp", utils.GetExecutableDir()), "cp-*")
-		
-			if err != nil {
-				logger.Error("Error creating folder, %v", err)
-			}
-			img, err := os.Open(imgDir)//, os.O_RDWR|os.O_CREATE, 0644)
-			if err != nil {
-				logger.Error("Can't open image dir: %v", err)
-			}
-			return img	
+func createCpDir() string {
+	imgDir, err := os.MkdirTemp(fmt.Sprintf("%v/temp", utils.GetExecutableDir()), "cp-*")
+	if err != nil {
+		logger.Error("Error creating folder, %v", err)
+	}
+	return imgDir
 }
 func findTreeByDir(tree *checkpointmanager.CheckpointTree, dir string) *checkpointmanager.CheckpointTree {
 	if dir == tree.GetCheckpointDir() {
@@ -271,8 +270,8 @@ func calculateReverseStepCommands(cmd *command.Command) {
 		bpmap[i] = nodeconnection.GetBreakpoints(i)
 	}
 
-	// tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
-	restore(rootCheckpointTree.GetCheckpointDir(), pid, numProcesses)
+	tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
+	restore(tree.GetCheckpointDir(), pid, numProcesses)
 	websocket.HandleCriuRestore(0)
 	checkpointmanager.SetCheckpointLog(0)
 
@@ -336,9 +335,9 @@ func calculateReverseContinueCommands(cmd *command.Command) {
 		bpmap[i] = nodeconnection.GetBreakpoints(i)
 	}
 
-	// tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
-	breakpointHitMap := reverseContLoop(cmd, rootCheckpointTree.GetCheckpointDir(), counters, bpmap, nil, false)
-	reverseContLoop(cmd, rootCheckpointTree.GetCheckpointDir(), counters, bpmap, breakpointHitMap, true)
+	tree, _ := findTreeCandidateCounter(cmd, *currentCheckpointTree)
+	breakpointHitMap := reverseContLoop(cmd, tree.GetCheckpointDir(), counters, bpmap, nil, false)
+	reverseContLoop(cmd, tree.GetCheckpointDir(), counters, bpmap, breakpointHitMap, true)
 
 	// Remove the breakpoint that was hit
 	for i := 0; i < numProcesses; i++ {
@@ -551,7 +550,7 @@ func copy(src string, dst string) {
 
 func restoreCriu(checkpointDir string, pid int, numProcesses int) *os.File {
 
-	cmd := exec.Command("criu", "restore", "-v4", "--unprivileged", "-o", "restore.log", "-j", "-D", checkpointDir) //"--tcp-established",
+	cmd := exec.Command("criu", "restore", "-v4", "--unprivileged", "--track-mem", "-o", "restore.log", "-j", "-D", checkpointDir) //"--tcp-established",
 
 	f, err := pty.Start(cmd)
 	if err != nil {
@@ -564,10 +563,10 @@ func restoreCriu(checkpointDir string, pid int, numProcesses int) *os.File {
 	return f
 }
 
-func checkpoint(c *criu.Criu) string{
-	if program=="criu"{
-		return checkpointCRIU(numProcesses, c, pid, true)
-	}else{ // if program=="dmtcp"
+func checkpoint(c *criu.Criu, prevImgDir string) string {
+	if program == "criu" {
+		return checkpointCRIU(numProcesses, c, pid, true, prevImgDir)
+	} else { // if program=="dmtcp"
 		return checkpointDmtcp()
 	}
 }
@@ -598,15 +597,15 @@ func checkpointDmtcp() string{
 		logger.Error("problem renameing",err)
 	}
 	for _, e := range entries {
-		err :=  os.Rename(dmtcpImgDir+"/"+e.Name(), imgDir.Name()+"/"+e.Name())
+		err := os.Rename(dmtcpImgDir+"/"+e.Name(), imgDir+"/"+e.Name())
 		if err != nil {
 			fmt.Println(err)
 		}
-    }
-	return imgDir.Name()
+	}
+	return imgDir
 }
 
-func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool) string {
+func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool, prevImgDir string) string {
 	nodeconnection.Stop()
 	nodeconnection.Detach()
 	nodeconnection.Reset()
@@ -619,17 +618,17 @@ func checkpointCRIU(numProcesses int, c *criu.Criu, pid int, leave_running bool)
 	if err != nil {
 		logger.Error("Error creating folder, %v", err)
 	}*/
-	logger.Info(imgDir.Name())
+	logger.Info(imgDir)
 
 	// Calls CRIU, saves process data to checkpointDir
-	Dump(c, strconv.Itoa(pid), false, imgDir.Name(), "", leave_running)
+	Dump(c, strconv.Itoa(pid), false, imgDir, prevImgDir, leave_running)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go connectBackToNodes(numProcesses, true, &wg)
 	wg.Wait()
 	// logger.Verbose("UPPER CP FINISH")
-	return imgDir.Name()
+	return imgDir
 }
 
 func Dump(c *criu.Criu, pidS string, pre bool, imgDir string, prevImg string, leave_running bool) {
@@ -654,13 +653,18 @@ func Dump(c *criu.Criu, pidS string, pre bool, imgDir string, prevImg string, le
 		// TcpEstablished: proto.Bool(true),
 		Unprivileged: proto.Bool(true),
 		GhostLimit:   proto.Uint32(1048576 * 64),
+		TrackMem:     proto.Bool(true),
 	}
 
 	logger.Info(imgDir)
 
 	if prevImg != "" {
-		opts.ParentImg = proto.String(prevImg)
-		opts.TrackMem = proto.Bool(true)
+		relPath, err := filepath.Rel(imgDir, prevImg)
+		if err != nil {
+			logger.Error("Could not calculate relative path: %v", err)
+		} else {
+			opts.ParentImg = proto.String(relPath)
+		}
 	}
 
 	if pre {
