@@ -1,9 +1,8 @@
 package main
 
 import (
-	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 
 	"github.com/mihkeltiks/rev-mpi-deb/logger"
 )
@@ -16,11 +15,14 @@ func precleanup() {
 func removeTempFiles() {
 	logger.Debug("removing temporary files..")
 
-	dir, _ := ioutil.ReadDir("bin/temp")
+	dir, err := os.ReadDir("bin/temp")
+	if err != nil {
+		return
+	}
 
 	for _, d := range dir {
 		if d.Name() != ".gitkeep" {
-			os.Remove(path.Join("bin/temp", d.Name()))
+			_ = os.RemoveAll(filepath.Join("bin/temp", d.Name()))
 		}
 	}
 }
