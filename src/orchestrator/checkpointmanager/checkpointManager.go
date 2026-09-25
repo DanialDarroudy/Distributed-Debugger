@@ -458,6 +458,18 @@ func copyDirectory(src, dst string) error {
 		srcPath := filepath.Join(src, entry.Name())
 		dstPath := filepath.Join(dst, entry.Name())
 
+		if entry.Type()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			_ = os.Remove(dstPath)
+			if err := os.Symlink(linkTarget, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+
 		if entry.IsDir() {
 			if err := os.MkdirAll(dstPath, 0755); err != nil {
 				return err
