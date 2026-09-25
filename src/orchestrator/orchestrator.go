@@ -42,7 +42,24 @@ var numProcesses int
 var program string
 var dmtcpImgDir string
 
+var (
+	l1BaseDir    = "/dev/shm/rev_mpi_deb_l1"
+	l2BaseDir    = "./bin/temp"
+	tierMigrator *checkpointmanager.TierMigrator
+)
+
+func initMultiLevelCheckpointing() {
+	if envL1 := os.Getenv("REV_DEB_L1_DIR"); envL1 != "" {
+		l1BaseDir = envL1
+	}
+	_ = os.MkdirAll(l1BaseDir, 0777)
+	_ = os.MkdirAll(l2BaseDir, 0755)
+
+	tierMigrator = checkpointmanager.NewTierMigrator(50, 2)
+}
+
 func main() {
+	initMultiLevelCheckpointing()
 	logger.SetMaxLogLevel(logger.Levels.Verbose)
 	numProcessesCLI, targetPath, programloc := cli.ParseArgs()
 	program=programloc
@@ -155,6 +172,7 @@ func main() {
 		checkpointDir,
 		nil,
 		make([]int, numProcesses))
+	tierMigrator.EnqueueMigration(&rootCheckpointTree, checkpointDir, filepath.Join(l2BaseDir, filepath.Base(checkpointDir)))
 
 	currentCheckpointTree = &rootCheckpointTree
 
@@ -193,6 +211,7 @@ func main() {
 				checkpointDir,
 				currentCommandlog,
 				nodeconnection.GetAllNodeCounters())
+			tierMigrator.EnqueueMigration(currentCheckpointTree, checkpointDir, filepath.Join(l2BaseDir, filepath.Base(checkpointDir)))
 
 			currentCheckpointTree.GetParentTree().AddChildTree(currentCheckpointTree)
 
@@ -225,7 +244,7 @@ func main() {
 	}
 }
 func createCpDir() string {
-	imgDir, err := os.MkdirTemp(fmt.Sprintf("%v/temp", utils.GetExecutableDir()), "cp-*")
+	imgDir, err := os.MkdirTemp(l1BaseDir, "cp-*")
 	if err != nil {
 		logger.Error("Error creating folder, %v", err)
 	}
@@ -495,6 +514,14 @@ func restore(checkpointDir string, pid int, numProcesses int) *os.File {
 			checkpointDir = currentCheckpointTree.GetParentTree().GetCheckpointDir()
 		}
 	}
+
+	if _, err := os.Stat(checkpointDir); os.IsNotExist(err) {
+		l2Candidate := filepath.Join(l2BaseDir, filepath.Base(checkpointDir))
+		if _, err2 := os.Stat(l2Candidate); err2 == nil {
+			checkpointDir = l2Candidate
+		}
+	}
+
 	nodeconnection.Kill()
 	nodeconnection.DisconnectAllNodes()
 	nodeconnection.Empty()
@@ -720,6 +747,9 @@ func startCheckpointRecordCollector(
 }
 
 func quit() {
+	if tierMigrator != nil {
+		tierMigrator.Close()
+	}
 	nodeconnection.StopAllNodes()
 	gui.Stop()
 
