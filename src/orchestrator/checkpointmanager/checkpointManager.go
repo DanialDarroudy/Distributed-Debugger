@@ -3,7 +3,6 @@ package checkpointmanager
 import (
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -408,15 +407,15 @@ func (tm *TierMigrator) EnqueueMigration(tree *CheckpointTree, l1Path, l2Path st
 }
 
 func (tm *TierMigrator) performMigration(task MigrationTask) error {
-	log.Printf("[MultiLevel] Starting async migration: L1 (%s) -> L2 (%s)\n", task.L1Path, task.L2Path)
+	logger.Info("[MultiLevel] Starting async migration: L1 (%s) -> L2 (%s)", task.L1Path, task.L2Path)
 
 	if err := os.MkdirAll(task.L2Path, 0755); err != nil {
-		log.Printf("[MultiLevel ERROR] Failed to create L2 dir: %v\n", err)
+		logger.Error("[MultiLevel ERROR] Failed to create L2 dir: %v", err)
 		return err
 	}
 
 	if err := copyDirectory(task.L1Path, task.L2Path); err != nil {
-		log.Printf("[MultiLevel ERROR] Copy failed from %s: %v\n", task.L1Path, err)
+		logger.Error("[MultiLevel ERROR] Copy failed from %s: %v", task.L1Path, err)
 		return err
 	}
 
@@ -424,7 +423,7 @@ func (tm *TierMigrator) performMigration(task MigrationTask) error {
 		task.Tree.MarkTier(TierL2Available)
 	}
 
-	log.Printf("[MultiLevel SUCCESS] Checkpoint safely synced to L2 (%s)\n", task.L2Path)
+	logger.Info("[MultiLevel SUCCESS] Checkpoint safely synced to L2 (%s)", task.L2Path)
 	tm.enforceRetention()
 	return nil
 }
@@ -436,7 +435,7 @@ func (tm *TierMigrator) enforceRetention() {
 	for len(tm.trackedList) > tm.retentionL1 {
 		oldTree := tm.trackedList[0]
 		if oldTree.tier == TierL2Available && oldTree.l1Dir != "" {
-			log.Printf("[MultiLevel Retention] Freeing L1 RAM cache: %s\n", oldTree.l1Dir)
+			logger.Verbose("[MultiLevel Retention] Freeing L1 RAM cache: %s", oldTree.l1Dir)
 			_ = os.RemoveAll(oldTree.l1Dir)
 			oldTree.EvictL1()
 		}
