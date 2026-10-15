@@ -2,7 +2,11 @@ package checkpointmanager
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strconv"
+	"sync"
 
 	"github.com/mihkeltiks/rev-mpi-deb/logger"
 	"github.com/mihkeltiks/rev-mpi-deb/rpc"
@@ -11,6 +15,14 @@ import (
 )
 
 type NodeId int
+
+type StorageTier int
+
+const (
+	TierL1Only StorageTier = iota
+	TierSyncing
+	TierL2Available
+)
 
 type checkpointRecord struct {
 	Id              string
@@ -31,8 +43,13 @@ type CheckpointTree struct {
 	parentTree          *CheckpointTree
 	childrenCheckpoints []*CheckpointTree
 	checkpointDir       string
+	l1Dir               string
+	l2Dir               string
+	tier                StorageTier
+	l1Evicted           bool
 	commandLog          CommandLog
 	counters            []int
+	mu                  sync.RWMutex
 }
 
 // Data structure for maintaining a list of recorded checkpoints by node
@@ -46,6 +63,27 @@ type CommandLog []command.Command
 var checkpointLog = make(CheckpointLog)
 var checkpointLogList CheckpointLogList
 
+func (cpTree *CheckpointTree) SetTiers(l1Dir, l2Dir string) {
+	cpTree.mu.Lock()
+	defer cpTree.mu.Unlock()
+	cpTree.l1Dir = l1Dir
+	cpTree.l2Dir = l2Dir
+	cpTree.checkpointDir = l1Dir
+	cpTree.tier = TierL1Only
+}
+
+func (cpTree *CheckpointTree) MarkTier(tier StorageTier) {
+	cpTree.mu.Lock()
+	defer cpTree.mu.Unlock()
+	cpTree.tier = tier
+}
+
+func (cpTree *CheckpointTree) EvictL1() {
+	cpTree.mu.Lock()
+	defer cpTree.mu.Unlock()
+	cpTree.l1Evicted = true
+}
+
 func MakeCheckpointTree(cplog CheckpointLog, parentcp *CheckpointTree, childrencps []*CheckpointTree, cpdir string, cmdlog CommandLog, counters []int) *CheckpointTree {
 	tree := CheckpointTree{
 		checkpointLog:       cplog,
@@ -54,6 +92,7 @@ func MakeCheckpointTree(cplog CheckpointLog, parentcp *CheckpointTree, childrenc
 		checkpointDir:       cpdir,
 		commandLog:          cmdlog,
 		counters:            counters,
+		tier:                TierL1Only,
 	}
 
 	return &tree
@@ -80,6 +119,17 @@ func (cpTree CheckpointTree) HasParent() bool {
 }
 
 func (cpTree CheckpointTree) GetCheckpointDir() string {
+	cpTree.mu.RLock()
+	defer cpTree.mu.RUnlock()
+
+	if !cpTree.l1Evicted && cpTree.l1Dir != "" {
+		if _, err := os.Stat(cpTree.l1Dir); err == nil {
+			return cpTree.l1Dir
+		}
+	}
+	if cpTree.l2Dir != "" {
+		return cpTree.l2Dir
+	}
 	return cpTree.checkpointDir
 }
 
@@ -91,7 +141,7 @@ func (cpTree CheckpointTree) Print() {
 	logger.Verbose("cplog %v", cpTree.checkpointLog)
 	logger.Verbose("parent %v", cpTree.parentTree)
 	logger.Verbose("children %v", cpTree.childrenCheckpoints)
-	logger.Verbose("cpdir %v", cpTree.checkpointDir)
+	logger.Verbose("cpdir %v", cpTree.GetCheckpointDir())
 	logger.Verbose("commandlog %v", cpTree.commandLog)
 }
 
@@ -291,4 +341,165 @@ func RemoveCurrentCheckpointMarkersOnNode(nodeId NodeId) {
 
 func (c checkpointRecord) String() string {
 	return fmt.Sprintf("%v - %v", c.Id, c.OpName)
+}
+
+type MigrationTask struct {
+	Tree       *CheckpointTree
+	L1Path     string
+	L2Path     string
+	NotifyChan chan error
+}
+
+type TierMigrator struct {
+	taskQueue   chan MigrationTask
+	retentionL1 int
+	trackedList []*CheckpointTree
+	mu          sync.Mutex
+	wg          sync.WaitGroup
+	stopChan    chan struct{}
+}
+
+func NewTierMigrator(queueSize int, retentionL1 int) *TierMigrator {
+	if retentionL1 < 1 {
+		retentionL1 = 2 // We retain at least the two most recent checkpoints at L1 to ensure fast incremental checkpointing.
+	}
+	tm := &TierMigrator{
+		taskQueue:   make(chan MigrationTask, queueSize),
+		retentionL1: retentionL1,
+		trackedList: make([]*CheckpointTree, 0),
+		stopChan:    make(chan struct{}),
+	}
+	tm.startWorker()
+	return tm
+}
+
+func (tm *TierMigrator) startWorker() {
+	tm.wg.Add(1)
+	go func() {
+		defer tm.wg.Done()
+		for {
+			select {
+			case task := <-tm.taskQueue:
+				err := tm.performMigration(task)
+				if task.NotifyChan != nil {
+					task.NotifyChan <- err
+				}
+			case <-tm.stopChan:
+				return
+			}
+		}
+	}()
+}
+
+func (tm *TierMigrator) EnqueueMigration(tree *CheckpointTree, l1Path, l2Path string) {
+	tm.mu.Lock()
+	if tree != nil {
+		tree.MarkTier(TierSyncing)
+		tm.trackedList = append(tm.trackedList, tree)
+	}
+	tm.mu.Unlock()
+
+	tm.taskQueue <- MigrationTask{
+		Tree:   tree,
+		L1Path: l1Path,
+		L2Path: l2Path,
+	}
+}
+
+func (tm *TierMigrator) performMigration(task MigrationTask) error {
+	logger.Info("[MultiLevel] Starting async migration: L1 (%s) -> L2 (%s)", task.L1Path, task.L2Path)
+
+	if err := os.MkdirAll(task.L2Path, 0755); err != nil {
+		logger.Error("[MultiLevel ERROR] Failed to create L2 dir: %v", err)
+		return err
+	}
+
+	if err := copyDirectory(task.L1Path, task.L2Path); err != nil {
+		logger.Error("[MultiLevel ERROR] Copy failed from %s: %v", task.L1Path, err)
+		return err
+	}
+
+	if task.Tree != nil {
+		task.Tree.MarkTier(TierL2Available)
+	}
+
+	logger.Info("[MultiLevel SUCCESS] Checkpoint safely synced to L2 (%s)", task.L2Path)
+	tm.enforceRetention()
+	return nil
+}
+
+func (tm *TierMigrator) enforceRetention() {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	for len(tm.trackedList) > tm.retentionL1 {
+		oldTree := tm.trackedList[0]
+		if oldTree.tier == TierL2Available && oldTree.l1Dir != "" {
+			logger.Verbose("[MultiLevel Retention] Freeing L1 RAM cache: %s", oldTree.l1Dir)
+			_ = os.RemoveAll(oldTree.l1Dir)
+			oldTree.EvictL1()
+		}
+		tm.trackedList = tm.trackedList[1:]
+	}
+}
+
+func (tm *TierMigrator) Close() {
+	close(tm.stopChan)
+	tm.wg.Wait()
+}
+
+func copyDirectory(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.Type()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(srcPath)
+			if err != nil {
+				return err
+			}
+			_ = os.Remove(dstPath)
+			if err := os.Symlink(linkTarget, dstPath); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if entry.IsDir() {
+			if err := os.MkdirAll(dstPath, 0755); err != nil {
+				return err
+			}
+			if err := copyDirectory(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
 }
